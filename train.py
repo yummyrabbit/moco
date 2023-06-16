@@ -1,126 +1,150 @@
-import torch
-import torch.nn as nn
-import torch.optim as optim
-import torchvision
-import torchvision.transforms as transforms
 import argparse
-from resnet import ResNet18
-import os
 
-# 定义是否使用GPU
-device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+import pandas as pd
+import torch
+import torch.nn.functional as F
+import torch.optim as optim
+from torch.utils.data import DataLoader
+from tqdm import tqdm
 
-# 参数设置,使得我们能够手动输入命令行参数，就是让风格变得和Linux命令行差不多
-parser = argparse.ArgumentParser(description='PyTorch CIFAR10 Training')
-parser.add_argument('--outf', default='./model/', help='folder to output images and model checkpoints')  # 输出结果保存路径
-args = parser.parse_args()
+import utils
+from model import Model
 
-# 超参数设置
-EPOCH = 240  # 遍历数据集次数
-pre_epoch = 0  # 定义已经遍历数据集的次数
-BATCH_SIZE = 128  # 批处理尺寸(batch_size)
 
-# 准备数据集并预处理
-transform_train = transforms.Compose([
-    transforms.RandomCrop(32, padding=4),  # 先四周填充0，在吧图像随机裁剪成32*32
-    transforms.RandomHorizontalFlip(),  # 图像一半的概率翻转，一半的概率不翻转
-    transforms.ToTensor(),
-    transforms.Normalize((0.4914, 0.4822, 0.4465), (0.2023, 0.1994, 0.2010)),  # R,G,B每层的归一化用到的均值和方差
-])
+# train for one epoch to learn unique features
+def train(encoder_q, encoder_k, data_loader, train_optimizer):
+    global memory_queue
+    encoder_q.train()
+    total_loss, total_num, train_bar = 0.0, 0, tqdm(data_loader)
+    for x_q, x_k, _ in train_bar:
+        x_q, x_k = x_q.cuda(non_blocking=True), x_k.cuda(non_blocking=True)
+        _, query = encoder_q(x_q)
 
-transform_test = transforms.Compose([
-    transforms.ToTensor(),
-    transforms.Normalize((0.4914, 0.4822, 0.4465), (0.2023, 0.1994, 0.2010)),
-])
+        # shuffle BN
+        idx = torch.randperm(x_k.size(0), device=x_k.device)
+        _, key = encoder_k(x_k[idx])
+        key = key[torch.argsort(idx)]
 
-trainset = torchvision.datasets.CIFAR10(root='./data', train=True, download=False, transform=transform_train)  # 训练数据集
-trainloader = torch.utils.data.DataLoader(trainset, batch_size=BATCH_SIZE, shuffle=True,
-                                          num_workers=2)  # 生成一个个batch进行批训练，组成batch的时候顺序打乱取
+        score_pos = torch.bmm(query.unsqueeze(dim=1), key.unsqueeze(dim=-1)).squeeze(dim=-1)
+        score_neg = torch.mm(query, memory_queue.t().contiguous())
+        # [B, 1+M]
+        out = torch.cat([score_pos, score_neg], dim=-1)
+        # compute loss
+        loss = F.cross_entropy(out / temperature, torch.zeros(x_q.size(0), dtype=torch.long, device=x_q.device))
 
-testset = torchvision.datasets.CIFAR10(root='./data', train=False, download=False, transform=transform_test)
-testloader = torch.utils.data.DataLoader(testset, batch_size=100, shuffle=False, num_workers=2)
-# Cifar-10的标签
-classes = ('plane', 'car', 'bird', 'cat', 'deer', 'dog', 'frog', 'horse', 'ship', 'truck')
+        train_optimizer.zero_grad()
+        loss.backward()
+        train_optimizer.step()
 
-# 模型定义-ResNet
-net = ResNet18().to(device)
+        # momentum update
+        for parameter_q, parameter_k in zip(encoder_q.parameters(), encoder_k.parameters()):
+            parameter_k.data.copy_(parameter_k.data * momentum + parameter_q.data * (1.0 - momentum))
+        # update queue
+        memory_queue = torch.cat((memory_queue, key), dim=0)[key.size(0):]
 
-# 定义损失函数和优化方式
-criterion = nn.CrossEntropyLoss()  # 损失函数为交叉熵，多用于多分类问题
-optimizer = optim.SGD(net.parameters(), lr=0.1, momentum=0.9,
-                      weight_decay=5e-4)  # 优化方式为mini-batch momentum-SGD，并采用L2正则化（权重衰减）
+        total_num += x_q.size(0)
+        total_loss += loss.item() * x_q.size(0)
+        train_bar.set_description('Train Epoch: [{}/{}] Loss: {:.4f}'.format(epoch, epochs, total_loss / total_num))
 
-# 训练
-if __name__ == "__main__":
-    if not os.path.exists(args.outf):
-        os.makedirs(args.outf)
-    best_acc = 85  # 2 初始化best test accuracy
-    print("Start Training, Resnet-18!")  # 定义遍历数据集的次数
-    with open("acc.txt", "w") as f:
-        with open("log.txt", "w") as f2:
-            for epoch in range(pre_epoch, EPOCH):
-                if epoch == 135:
-                    optimizer = optim.SGD(net.parameters(), lr=0.01, momentum=0.9,
-                                          weight_decay=5e-4)
-                if epoch == 185:
-                    optimizer = optim.SGD(net.parameters(), lr=0.001, momentum=0.9,
-                                          weight_decay=5e-4)
-                print('\nEpoch: %d' % (epoch + 1))
-                net.train()
-                sum_loss = 0.0
-                correct = 0.0
-                total = 0.0
-                for i, data in enumerate(trainloader, 0):
-                    # 准备数据
-                    length = len(trainloader)
-                    inputs, labels = data
-                    inputs, labels = inputs.to(device), labels.to(device)
-                    optimizer.zero_grad()
+    return total_loss / total_num
 
-                    # forward + backward
-                    outputs = net(inputs)
-                    loss = criterion(outputs, labels)
-                    loss.backward()
-                    optimizer.step()
 
-                    # 每训练1个batch打印一次loss和准确率
-                    sum_loss += loss.item()
-                    _, predicted = torch.max(outputs.data, 1)
-                    total += labels.size(0)
-                    correct += predicted.eq(labels.data).cpu().sum()
-                    print('[epoch:%d, iter:%d] Loss: %.03f | Acc: %.3f%% '
-                          % (epoch + 1, (i + 1 + epoch * length), sum_loss / (i + 1), 100. * correct / total))
-                    f2.write('%03d  %05d |Loss: %.03f | Acc: %.3f%% '
-                             % (epoch + 1, (i + 1 + epoch * length), sum_loss / (i + 1), 100. * correct / total))
-                    f2.write('\n')
-                    f2.flush()
+# test for one epoch, use weighted knn to find the most similar images' label to assign the test image
+def test(net, memory_data_loader, test_data_loader):
+    net.eval()
+    total_top1, total_top5, total_num, feature_bank = 0.0, 0.0, 0, []
+    with torch.no_grad():
+        # generate feature bank
+        for data, _, target in tqdm(memory_data_loader, desc='Feature extracting'):
+            feature, out = net(data.cuda(non_blocking=True))
+            feature_bank.append(feature)
+        # [D, N]
+        feature_bank = torch.cat(feature_bank, dim=0).t().contiguous()
+        # [N]
+        feature_labels = torch.tensor(memory_data_loader.dataset.targets, device=feature_bank.device)
+        # loop test data to predict the label by weighted knn search
+        test_bar = tqdm(test_data_loader)
+        for data, _, target in test_bar:
+            data, target = data.cuda(non_blocking=True), target.cuda(non_blocking=True)
+            feature, out = net(data)
 
-                # 每训练完一个epoch测试一下准确率
-                print("Waiting Test!")
-                with torch.no_grad():
-                    correct = 0
-                    total = 0
-                    for data in testloader:
-                        net.eval()
-                        images, labels = data
-                        images, labels = images.to(device), labels.to(device)
-                        outputs = net(images)
-                        # 取得分最高的那个类 (outputs.data的索引号)
-                        _, predicted = torch.max(outputs.data, 1)
-                        total += labels.size(0)
-                        correct += (predicted == labels).sum()
-                    print('测试分类准确率为：%.3f%%' % (100 * correct / total))
-                    acc = 100. * correct / total
-                    # 将每次测试结果实时写入acc.txt文件中
-                    print('Saving model......')
-                    torch.save(net.state_dict(), '%s/net_%03d.pth' % (args.outf, epoch + 1))
-                    f.write("EPOCH=%03d,Accuracy= %.3f%%" % (epoch + 1, acc))
-                    f.write('\n')
-                    f.flush()
-                    # 记录最佳测试分类准确率并写入best_acc.txt文件中
-                    if acc > best_acc:
-                        f3 = open("best_acc.txt", "w")
-                        f3.write("EPOCH=%d,best_acc= %.3f%%" % (epoch + 1, acc))
-                        f3.close()
-                        best_acc = acc
-            print("Training Finished, TotalEPOCH=%d" % EPOCH)
+            total_num += data.size(0)
+            # compute cos similarity between each feature vector and feature bank ---> [B, N]
+            sim_matrix = torch.mm(feature, feature_bank)
+            # [B, K]
+            sim_weight, sim_indices = sim_matrix.topk(k=k, dim=-1)
+            # [B, K]
+            sim_labels = torch.gather(feature_labels.expand(data.size(0), -1), dim=-1, index=sim_indices)
+            sim_weight = (sim_weight / temperature).exp()
+
+            # counts for each class
+            one_hot_label = torch.zeros(data.size(0) * k, c, device=sim_labels.device)
+            # [B*K, C]
+            one_hot_label = one_hot_label.scatter(dim=-1, index=sim_labels.view(-1, 1), value=1.0)
+            # weighted score ---> [B, C]
+            pred_scores = torch.sum(one_hot_label.view(data.size(0), -1, c) * sim_weight.unsqueeze(dim=-1), dim=1)
+
+            pred_labels = pred_scores.argsort(dim=-1, descending=True)
+            total_top1 += torch.sum((pred_labels[:, :1] == target.unsqueeze(dim=-1)).any(dim=-1).float()).item()
+            total_top5 += torch.sum((pred_labels[:, :5] == target.unsqueeze(dim=-1)).any(dim=-1).float()).item()
+            test_bar.set_description('Test Epoch: [{}/{}] Acc@1:{:.2f}% Acc@5:{:.2f}%'
+                                     .format(epoch, epochs, total_top1 / total_num * 100, total_top5 / total_num * 100))
+
+    return total_top1 / total_num * 100, total_top5 / total_num * 100
+
+
+if __name__ == '__main__':
+    parser = argparse.ArgumentParser(description='Train MoCo')
+    parser.add_argument('--feature_dim', default=128, type=int, help='Feature dim for each image')
+    parser.add_argument('--m', default=4096, type=int, help='Negative sample number')
+    parser.add_argument('--temperature', default=0.5, type=float, help='Temperature used in softmax')
+    parser.add_argument('--momentum', default=0.999, type=float, help='Momentum used for the update of memory bank')
+    parser.add_argument('--k', default=200, type=int, help='Top k most similar images used to predict the label')
+    parser.add_argument('--batch_size', default=256, type=int, help='Number of images in each mini-batch')
+    parser.add_argument('--epochs', default=400, type=int, help='Number of sweeps over the dataset to train')
+
+    # args parse
+    args = parser.parse_args()
+    feature_dim, m, temperature, momentum = args.feature_dim, args.m, args.temperature, args.momentum
+    k, batch_size, epochs = args.k, args.batch_size, args.epochs
+
+    # data prepare
+    train_data = utils.CIFAR10Pair(root='data', train=True, transform=utils.train_transform, download=True)
+    train_loader = DataLoader(train_data, batch_size=batch_size, shuffle=True, num_workers=16, pin_memory=True,
+                              drop_last=True)
+    memory_data = utils.CIFAR10Pair(root='data', train=True, transform=utils.test_transform, download=True)
+    memory_loader = DataLoader(memory_data, batch_size=batch_size, shuffle=False, num_workers=16, pin_memory=True)
+    test_data = utils.CIFAR10Pair(root='data', train=False, transform=utils.test_transform, download=True)
+    test_loader = DataLoader(test_data, batch_size=batch_size, shuffle=False, num_workers=16, pin_memory=True)
+
+    # model setup and optimizer config
+    model_q = Model(feature_dim).cuda()
+    model_k = Model(feature_dim).cuda()
+    # initialize
+    for param_q, param_k in zip(model_q.parameters(), model_k.parameters()):
+        param_k.data.copy_(param_q.data)
+        # not update by gradient
+        param_k.requires_grad = False
+    optimizer = optim.Adam(model_q.parameters(), lr=1e-3, weight_decay=1e-6)
+
+    # c as num of train class
+    c = len(memory_data.classes)
+    # init memory queue as unit random vector ---> [M, D]
+    memory_queue = F.normalize(torch.randn(m, feature_dim).cuda(), dim=-1)
+
+    # training loop
+    results = {'train_loss': [], 'test_acc@1': [], 'test_acc@5': []}
+    best_acc = 0.0
+    for epoch in range(1, epochs + 1):
+        train_loss = train(model_q, model_k, train_loader, optimizer)
+        results['train_loss'].append(train_loss)
+        test_acc_1, test_acc_5 = test(model_q, memory_loader, test_loader)
+        results['test_acc@1'].append(test_acc_1)
+        results['test_acc@5'].append(test_acc_5)
+        # save statistics
+        data_frame = pd.DataFrame(data=results, index=range(1, epoch + 1))
+        data_frame.to_csv('results/pretrain_results.csv', index_label='epoch')
+        if test_acc_1 > best_acc:
+            best_acc = test_acc_1
+            torch.save(model_q.state_dict(), 'results/best_model.pth')
+            print(epoch)
